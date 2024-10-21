@@ -15,7 +15,6 @@ from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from nltk.stem import WordNetLemmatizer
 
-# Download necessary NLTK data
 nltk.download('punkt')
 nltk.download('wordnet')
 nltk.download('stopwords')
@@ -23,8 +22,7 @@ nltk.download('stopwords')
 # Helper function to insert into SQL Server using pyodbc with column existence check
 def insert_into_table(cursor, table_name, columns, values, primary_key=None):
     """
-    Insert values into the specified table, with optional primary key checking.
-    Handles None values by replacing them with default values.
+    Insert values into the specified table, with primary key checking.
     """
     existing_columns = [col for col in columns if col in values.keys() and values[col] is not None]
     filtered_values = [values[col] if values[col] is not None else get_default_value(col) for col in existing_columns]
@@ -76,6 +74,7 @@ CREATE TABLE Feedback (
     FeedbackID INT PRIMARY KEY,
     CustomerID INT,
     FeedbackDate DATE,
+    ReviewID INT,
     ReviewText TEXT,
     Sentiment VARCHAR(20),
     Rating INT CHECK (Rating BETWEEN 1 AND 5),
@@ -86,6 +85,7 @@ CREATE TABLE Feedback (
     CategoryID INT,
     ProductID INT,
     ProductName VARCHAR(100),
+    ProductCategory VARCHAR(50),
     ProductPrice DECIMAL(10, 2),
     FOREIGN KEY (CustomerID) REFERENCES Customer(CustomerID)
 );
@@ -109,9 +109,7 @@ CREATE TABLE CustomerDim (
     PhoneNumber VARCHAR(50),
     Gender VARCHAR(10),
     Age INT,
-    Location VARCHAR(100),
-    ReviewText TEXT,
-    Sentiment VARCHAR(20)
+    Location VARCHAR(100)
 );
 
 IF OBJECT_ID('dbo.CategoryDim', 'U') IS NULL
@@ -144,9 +142,17 @@ IF OBJECT_ID('dbo.ProductDim', 'U') IS NULL
 CREATE TABLE ProductDim (
     ProductID INT PRIMARY KEY,
     ProductName VARCHAR(100),
+    ProductCategory VARCHAR(50),
     ProductPrice DECIMAL(10, 2),
     CategoryID INT,
     FOREIGN KEY (CategoryID) REFERENCES CategoryDim(CategoryID)
+);
+
+IF OBJECT_ID('dbo.ReviewDim', 'U') IS NULL
+CREATE TABLE ReviewDim (
+    ReviewID INT PRIMARY KEY,
+    ReviewText TEXT,
+    Sentiment VARCHAR(20)
 );
 
 IF OBJECT_ID('dbo.FeedbackFact', 'U') IS NULL
@@ -157,12 +163,14 @@ CREATE TABLE FeedbackFact (
     DateID INT,
     OrderID INT,
     ProductID INT,
+    ReviewID INT,
     Rating INT CHECK (Rating BETWEEN 1 AND 5),
     FOREIGN KEY (CustomerID) REFERENCES CustomerDim(CustomerID),
     FOREIGN KEY (CategoryID) REFERENCES CategoryDim(CategoryID),
     FOREIGN KEY (DateID) REFERENCES DateDim(DateID),
     FOREIGN KEY (OrderID) REFERENCES OrderDim(OrderID),
-    FOREIGN KEY (ProductID) REFERENCES ProductDim(ProductID)
+    FOREIGN KEY (ProductID) REFERENCES ProductDim(ProductID),
+    FOREIGN KEY (ReviewID) REFERENCES ReviewDim(ReviewID)
 );
 '''
 
@@ -188,9 +196,9 @@ def extract_load_raw_data():
             customer_columns = ['CustomerID', 'FirstName', 'LastName', 'Email', 'PhoneNumber', 'Gender', 'Age', 'Location']
             insert_into_table(cursor, 'Customer', customer_columns, row_dict, primary_key='CustomerID')
 
-            feedback_columns = ['FeedbackID', 'CustomerID', 'FeedbackDate', 'ReviewText', 'Sentiment', 'Rating',
+            feedback_columns = ['FeedbackID', 'CustomerID', 'FeedbackDate', 'ReviewID', 'ReviewText', 'Sentiment', 'Rating',
                                 'OrderID', 'OrderDate', 'OrderStatus', 'TotalAmount', 'CategoryID',
-                                'ProductID', 'ProductName', 'ProductPrice']
+                                'ProductID', 'ProductName', 'ProductCategory', 'ProductPrice']
             insert_into_table(cursor, 'Feedback', feedback_columns, row_dict, primary_key='FeedbackID')
 
             category_columns = ['CategoryID', 'CategoryNumber', 'CategoryName']
@@ -238,6 +246,33 @@ def transform_and_load_to_warehouse():
     df_cleaned['Week'] = df_cleaned['FeedbackDate'].dt.isocalendar().week
     df_cleaned['Quarter'] = df_cleaned['FeedbackDate'].dt.quarter
 
+    # Remove duplicates
+    df_cleaned = df_cleaned.drop_duplicates()
+
+    # Validate and clean dates
+    df_cleaned = df_cleaned.dropna(subset=['FeedbackDate', 'OrderDate'])
+
+    # Remove rows where OrderDate is after FeedbackDate
+    df_cleaned = df_cleaned[df_cleaned['OrderDate'] <= df_cleaned['FeedbackDate']]
+
+    # Fill or drop missing values
+    df_cleaned = df_cleaned.dropna(subset=['FirstName', 'LastName', 'Email', 'ProductCategory', 'ReviewText'])
+
+    # Fix outliers in 'Age' and 'Rating'
+    df_cleaned['Age'] = df_cleaned['Age'].clip(lower=18, upper=80)
+    df_cleaned['Rating'] = df_cleaned['Rating'].clip(lower=1, upper=5)
+
+    # Ensure valid 'OrderStatus' and 'Sentiment' values
+    valid_order_status = ['Shipped', 'Delivered', 'Cancelled', 'Pending', 'Returned']
+    df_cleaned = df_cleaned[df_cleaned['OrderStatus'].isin(valid_order_status)]
+
+    valid_sentiments = ['positive', 'neutral', 'negative']
+    df_cleaned = df_cleaned[df_cleaned['Sentiment'].isin(valid_sentiments)]
+
+    # Validate email and phone formats
+    df_cleaned['Email'] = df_cleaned['Email'].apply(lambda x: x if '@' in x else None)
+    df_cleaned['PhoneNumber'] = df_cleaned['PhoneNumber'].apply(lambda x: x if x.isdigit() and len(x) >= 10 else None)
+
     with pyodbc.connect('Driver={ODBC Driver 17 for SQL Server};'
                         'Server=localhost;'
                         'Database=FeedbackDW;'
@@ -249,7 +284,8 @@ def transform_and_load_to_warehouse():
                 cursor_warehouse.execute(query)
         conn_warehouse.commit()
 
-        unique_dates = df_cleaned[['FeedbackDate', 'Year', 'Month', 'Day', 'Week', 'Quarter']].drop_duplicates()
+        # Insert data into dimension tables
+        unique_dates = df_cleaned[['FeedbackDate', 'Year', 'Month', 'Day', 'Week', 'Quarter']]
         for _, row in unique_dates.iterrows():
             date_dim_columns = ['FeedbackDate', 'Year', 'Month', 'Day', 'Week', 'Quarter']
             insert_into_table(cursor_warehouse, 'DateDim', date_dim_columns, row.to_dict())
@@ -259,23 +295,34 @@ def transform_and_load_to_warehouse():
             cursor_warehouse.execute("SELECT DateID FROM DateDim WHERE FeedbackDate = ?", row_dict['FeedbackDate'])
             date_id = cursor_warehouse.fetchone()[0]
 
-            # Include ReviewText and Sentiment in CustomerDim
+            # Insert into CustomerDim
             customer_dim_columns = [
                 'CustomerID', 'FirstName', 'LastName', 'Email', 'PhoneNumber', 'Gender', 
-                'Age', 'Location', 'ReviewText', 'Sentiment'
+                'Age', 'Location'
             ]
             insert_into_table(cursor_warehouse, 'CustomerDim', customer_dim_columns, row_dict, primary_key='CustomerID')
 
+            # Insert into CategoryDim
             category_dim_columns = ['CategoryID', 'CategoryNumber', 'CategoryName']
             insert_into_table(cursor_warehouse, 'CategoryDim', category_dim_columns, row_dict, primary_key='CategoryID')
 
-            product_dim_columns = ['ProductID', 'ProductName', 'ProductPrice', 'CategoryID']
+            # Insert into ProductDim
+            product_dim_columns = ['ProductID', 'ProductName', 'ProductCategory', 'ProductPrice', 'CategoryID']
             insert_into_table(cursor_warehouse, 'ProductDim', product_dim_columns, row_dict, primary_key='ProductID')
 
+            # Insert into OrderDim
             order_dim_columns = ['OrderID', 'OrderDate', 'OrderStatus', 'TotalAmount']
             insert_into_table(cursor_warehouse, 'OrderDim', order_dim_columns, row_dict, primary_key='OrderID')
 
-            feedback_fact_columns = ['FeedbackID', 'CustomerID', 'CategoryID', 'ProductID', 'OrderID', 'Rating', 'DateID']
+            # Insert into ReviewDim
+            review_dim_columns = ['ReviewID', 'ReviewText', 'Sentiment']
+            insert_into_table(cursor_warehouse, 'ReviewDim', review_dim_columns, row_dict, primary_key='ReviewID')
+
+            # Insert into FeedbackFact
+            feedback_fact_columns = [
+                'FeedbackID', 'CustomerID', 'CategoryID', 'ProductID', 'OrderID', 
+                'ReviewID', 'Rating', 'DateID'
+            ]
             row_dict['DateID'] = date_id
             insert_into_table(cursor_warehouse, 'FeedbackFact', feedback_fact_columns, row_dict, primary_key='FeedbackID')
 
@@ -283,7 +330,6 @@ def transform_and_load_to_warehouse():
 
     print("Data transformation and loading completed successfully.")
     return df_cleaned
-
 
 # Task 3: Sentiment Analysis Model
 @task
@@ -294,7 +340,7 @@ def sentiment_analysis():
                         'Database=FeedbackDW;'
                         'Trusted_Connection=yes;') as conn_warehouse:
         df_feedback_fact = pd.read_sql("SELECT * FROM FeedbackFact", conn_warehouse)
-        df_reviews = pd.read_sql("SELECT * FROM CustomerDim", conn_warehouse)
+        df_reviews = pd.read_sql("SELECT * FROM ReviewDim", conn_warehouse)
 
     # Preprocess the text data
     stop_words = set(stopwords.words('english'))
@@ -336,10 +382,15 @@ def sentiment_analysis():
     # Save predictions to a DataFrame
     df_reviews['Predicted_Sentiment'] = model.predict(tfidf_vectorizer.transform(df_reviews['processed_text']))
 
+    # Map predicted sentiment to numeric values: positive -> 1, neutral -> 0, negative -> -1
+    sentiment_mapping = {'positive': 1, 'neutral': 0, 'negative': -1}
+    df_reviews['Predicted_Sentiment_Numeric'] = df_reviews['Predicted_Sentiment'].map(sentiment_mapping)
+
     # Export predictions to CSV
-    df_reviews[['CustomerID', 'ReviewText', 'Sentiment', 'Predicted_Sentiment']].to_csv('predicted_sentiments.csv', index=False)
+    df_reviews[['ReviewID', 'ReviewText', 'Sentiment', 'Predicted_Sentiment', 'Predicted_Sentiment_Numeric']].to_csv('predicted_sentiments.csv', index=False)
     print("Sentiment analysis predictions exported to predicted_sentiments.csv.")
     return df_reviews
+
 
 # Task 4: Export Data from Data Warehouse
 @task
@@ -348,10 +399,8 @@ def export_warehouse_data():
                         'Server=localhost;'
                         'Database=FeedbackDW;'
                         'Trusted_Connection=yes;') as conn_warehouse:
-        cursor_warehouse = conn_warehouse.cursor()
-
         # Export all tables to CSV for further analysis
-        for table in ['CustomerDim', 'CategoryDim', 'DateDim', 'OrderDim', 'ProductDim', 'FeedbackFact']:
+        for table in ['CustomerDim', 'CategoryDim', 'DateDim', 'OrderDim', 'ProductDim', 'ReviewDim', 'FeedbackFact']:
             df = pd.read_sql(f"SELECT * FROM {table}", conn_warehouse)
             df.to_csv(f"{table}.csv", index=False)
             print(f"{table} data exported to {table}.csv successfully.")
@@ -373,3 +422,4 @@ def etl_feedback_pipeline():
 
 if __name__ == "__main__":
     etl_feedback_pipeline()
+    
